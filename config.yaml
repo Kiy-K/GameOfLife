@@ -31,9 +31,9 @@ train:
   lambda_start: 0.1
   lambda_end: 0.3
   quantize_policy: true
-  num_workers: 7
-  pin_memory: true
-  persistent_workers: true
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
   prefetch_factor: 4
   matmul_precision: high
   accumulate_grad_batches: 1
