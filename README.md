@@ -195,6 +195,12 @@ If the agent is missing, `--backend rl` gracefully falls back to `auto` and prin
 
 `rl` backend includes runtime inference telemetry and warns periodically if average policy inference exceeds 5ms.
 
+Training performance knobs in `config.yaml`:
+
+- `train.num_workers` (set >0 for dataloader worker processes)
+- `train.pin_memory` and `train.persistent_workers`
+- `train.matmul_precision: high` (enables Tensor Core-friendly float32 matmul mode)
+
 Evaluate and export overlay animation:
 
 ```bash

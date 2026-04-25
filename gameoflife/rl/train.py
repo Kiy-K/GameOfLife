@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -314,7 +315,21 @@ class AdaptiveJumpLightning(pl.LightningModule):
 
     def train_dataloader(self):
         updates = int(self.cfg["train"].get("updates_per_epoch", 4))
-        return DataLoader(_DummyDataset(updates), batch_size=1, shuffle=False)
+        requested_workers = self.cfg["train"].get("num_workers")
+        if requested_workers is None:
+            cpu = os.cpu_count() or 1
+            requested_workers = min(8, max(1, cpu - 1))
+        num_workers = max(0, int(requested_workers))
+        pin_memory = bool(self.cfg["train"].get("pin_memory", torch.cuda.is_available()))
+        persistent_workers = bool(self.cfg["train"].get("persistent_workers", True)) and num_workers > 0
+        return DataLoader(
+            _DummyDataset(updates),
+            batch_size=1,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+        )
 
     def export_torchscript(
         self,
@@ -396,6 +411,10 @@ def _default_cfg() -> dict:
             "lambda_start": 0.1,
             "lambda_end": 0.3,
             "quantize_policy": True,
+            "num_workers": 7,
+            "pin_memory": True,
+            "persistent_workers": True,
+            "matmul_precision": "high",
             "log_dir": "runs",
         },
     }
@@ -408,6 +427,13 @@ def main() -> None:
 
     cfg_path = Path(args.config)
     cfg = _load_cfg(str(cfg_path)) if cfg_path.exists() else _default_cfg()
+    matmul_precision = str(cfg.get("train", {}).get("matmul_precision", "high")).lower()
+    if matmul_precision in {"high", "medium"}:
+        try:
+            torch.set_float32_matmul_precision(matmul_precision)
+            print(f"matmul_precision={matmul_precision}")
+        except Exception as exc:
+            print(f"[warn] could not set matmul precision ({exc})")
 
     pl.seed_everything(int(cfg["train"].get("seed", 42)), workers=True)
     model = AdaptiveJumpLightning(cfg)

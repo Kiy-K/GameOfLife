@@ -31,4 +31,8 @@ train:
   lambda_start: 0.1
   lambda_end: 0.3
   quantize_policy: true
+  num_workers: 7
+  pin_memory: true
+  persistent_workers: true
+  matmul_precision: high
   log_dir: runs
