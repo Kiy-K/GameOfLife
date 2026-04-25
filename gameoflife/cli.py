@@ -46,6 +46,17 @@ GOSPER_GLIDER_GUN = {
     (34, 2), (34, 3), (35, 2), (35, 3),
 }
 
+LARGERLIFE_PRESETS: dict[str, str] = {
+    # Bosco-tuned preset for this implementation (robust activity with center-excluded neighbor sums).
+    "bosco": "R5,B30-44,S28-52",
+    # Tighter growth/survival windows for more filamentary structures.
+    "coral": "R3,B9-14,S6-9",
+    # Slower moving fronts with wider radius.
+    "nova": "R6,B40-55,S38-52",
+    # Noisy aggregate behavior.
+    "storm": "R4,B18-28,S16-24",
+}
+
 
 class LifeEngine:
     name = "base"
@@ -125,16 +136,25 @@ def parse_generations_rule(rule: str | None) -> tuple[set[int], set[int], int]:
 
 
 def parse_largerlife_rule(rule: str | None) -> tuple[int, tuple[int, int], tuple[int, int]]:
-    # A commonly used LtL-style rule.
+    # Default to Bosco-like behavior.
     if not rule:
-        return 2, (34, 45), (34, 58)
+        rule = LARGERLIFE_PRESETS["bosco"]
     m = re.fullmatch(r"R(\d+),B(\d+)-(\d+),S(\d+)-(\d+)", rule.strip(), flags=re.IGNORECASE)
     if not m:
         raise ValueError(f"Invalid largerlife rule: {rule}. Expected format like R2,B34-45,S34-58.")
     radius = int(m.group(1))
     bmin, bmax = int(m.group(2)), int(m.group(3))
     smin, smax = int(m.group(4)), int(m.group(5))
-    if radius < 1 or bmin > bmax or smin > smax:
+    max_neighbors = (2 * radius + 1) ** 2 - 1
+    if (
+        radius < 1
+        or bmin > bmax
+        or smin > smax
+        or bmin < 0
+        or smin < 0
+        or bmax > max_neighbors
+        or smax > max_neighbors
+    ):
         raise ValueError(f"Invalid largerlife rule values: {rule}.")
     return radius, (bmin, bmax), (smin, smax)
 
@@ -979,6 +999,7 @@ class AutoAdaptiveEngine(LifeEngine):
     wrap: bool = False
     rule: str | None = None
     rule_file: str | None = None
+    rule_preset: str | None = None
     _selected: LifeEngine | None = None
     _init_state: tuple = ("empty",)
     _candidates: tuple[str, ...] = ("quicklife", "hashlife", "numba", "torch")
@@ -1005,6 +1026,7 @@ class AutoAdaptiveEngine(LifeEngine):
             wrap=self.wrap,
             rule=self.rule,
             rule_file=self.rule_file,
+            rule_preset=self.rule_preset,
         )
 
     def _select_fastest_backend(self) -> None:
@@ -1087,9 +1109,17 @@ def build_engine(
     wrap: bool,
     rule: str | None = None,
     rule_file: str | None = None,
+    rule_preset: str | None = None,
 ) -> LifeEngine:
     if backend == "auto":
-        return AutoAdaptiveEngine(width=width, height=height, wrap=wrap, rule=rule, rule_file=rule_file)
+        return AutoAdaptiveEngine(
+            width=width,
+            height=height,
+            wrap=wrap,
+            rule=rule,
+            rule_file=rule_file,
+            rule_preset=rule_preset,
+        )
     if backend == "jvn":
         radius, birth, survive = parse_jvn_rule(rule)
         return VonNeumannEngine(width=width, height=height, wrap=wrap, radius=radius, birth=birth, survive=survive)
@@ -1104,7 +1134,15 @@ def build_engine(
             states=states,
         )
     if backend == "largerlife":
-        radius, birth_range, survive_range = parse_largerlife_rule(rule)
+        selected_rule = rule
+        if rule_preset:
+            if rule_preset not in LARGERLIFE_PRESETS:
+                raise ValueError(
+                    f"Unknown largerlife preset: {rule_preset}. "
+                    f"Available: {', '.join(sorted(LARGERLIFE_PRESETS))}"
+                )
+            selected_rule = LARGERLIFE_PRESETS[rule_preset]
+        radius, birth_range, survive_range = parse_largerlife_rule(selected_rule)
         return LargerThanLifeEngine(
             width=width,
             height=height,
@@ -1451,7 +1489,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional rule string for certain backends: "
             "generations uses B../S../Ck (e.g. B2/S/C3), "
-            "largerlife uses Rr,Bx-y,Su-v (e.g. R2,B34-45,S34-58), "
+            "largerlife uses Rr,Bx-y,Su-v (e.g. R5,B34-45,S34-58), "
             "jvn uses B../S.. or Rn,B../S.. (e.g. R2,B3/S23)."
         ),
     )
@@ -1460,6 +1498,15 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to a JSON rule spec for --backend ruleloader.",
+    )
+    parser.add_argument(
+        "--rule-preset",
+        type=str,
+        default=None,
+        help=(
+            "Named rule preset (currently for largerlife). "
+            f"Available: {', '.join(sorted(LARGERLIFE_PRESETS))}."
+        ),
     )
     parser.add_argument(
         "--benchmark-steps",
@@ -1533,6 +1580,7 @@ def run_benchmark_all(
     steps: int,
     rule: str | None = None,
     rule_file: str | None = None,
+    rule_preset: str | None = None,
 ) -> None:
     print(
         (
@@ -1560,7 +1608,7 @@ def run_benchmark_all(
         if backend == "ruleloader" and not rule_file:
             print("backend=ruleloader skipped reason=rule_file_missing")
             continue
-        engine = build_engine(backend, width, height, wrap, rule, rule_file)
+        engine = build_engine(backend, width, height, wrap, rule, rule_file, rule_preset)
         sps, throughput, alive = run_benchmark(engine, pattern, density, seed, steps)
         print_benchmark_result(backend, steps, sps, throughput, alive)
 
@@ -1596,6 +1644,7 @@ def run_doctor(args: argparse.Namespace) -> int:
             wrap=args.wrap,
             rule=args.rule,
             rule_file=args.rule_file,
+            rule_preset=args.rule_preset,
         )
         _initialize_engine(engine, args.pattern, args.density, args.seed)
         engine.advance(1)
@@ -1628,10 +1677,11 @@ def main() -> None:
             steps=benchmark_steps,
             rule=args.rule,
             rule_file=args.rule_file,
+            rule_preset=args.rule_preset,
         )
         return
 
-    engine = build_engine(args.backend, width, height, args.wrap, args.rule, args.rule_file)
+    engine = build_engine(args.backend, width, height, args.wrap, args.rule, args.rule_file, args.rule_preset)
 
     if args.benchmark_steps > 0:
         sps, throughput, alive = run_benchmark(engine, args.pattern, args.density, args.seed, benchmark_steps)

@@ -69,11 +69,17 @@ gameoflife --backend jvn --rule R2,B3/S23 --pattern random --density 0.2 --width
 # Custom Generations rule
 gameoflife --backend generations --rule B3/S23/C5 --pattern random --density 0.2 --width 800 --height 500
 
-# Larger-than-Life default (R2,B34-45,S34-58)
-gameoflife --backend largerlife --pattern random --density 0.15 --width 900 --height 600 --interval 25
+# Larger-than-Life default (Bosco-tuned: R5,B30-44,S28-52)
+gameoflife --backend largerlife --pattern random --density 0.18 --width 900 --height 600 --interval 25
 
 # Custom Larger-than-Life rule
 gameoflife --backend largerlife --rule R3,B102-133,S102-142 --pattern random --density 0.12 --width 900 --height 600
+
+# Larger-than-Life presets
+gameoflife --backend largerlife --rule-preset bosco --pattern random --density 0.18 --width 900 --height 600
+gameoflife --backend largerlife --rule-preset coral --pattern random --density 0.22 --width 900 --height 600
+gameoflife --backend largerlife --rule-preset nova --pattern random --density 0.12 --width 900 --height 600
+gameoflife --backend largerlife --rule-preset storm --pattern random --density 0.18 --width 900 --height 600
 
 # RuleLoader-style JSON spec
 gameoflife --backend ruleloader --rule-file rules/example.rule.json --pattern random --density 0.2 --width 800 --height 500
@@ -117,6 +123,7 @@ Main options:
 - `--ui {gui,tui}`
 - `--backend {auto,jvn,generations,largerlife,ruleloader,quicklife,hashlife,hashlife-tree,numba,torch}`
 - `--rule` for `jvn`/`generations`/`largerlife`
+- `--rule-preset` for `largerlife` (`bosco`, `coral`, `nova`, `storm`)
 - `--rule-file` for `ruleloader`
 - `--width`, `--height`
 - `--pattern {glider-gun,random,empty}`
@@ -141,6 +148,7 @@ gameoflife --pattern random --density 0.2 --width 1000 --height 700 --benchmark-
 - Rules are canonical Conway Life: `B3/S23`.
 - Random initialization now uses a fixed-size sample (`floor(width*height*density)`) consistently across backends.
 - `jvn`, `generations`, and `largerlife` are built-in algorithm families with configurable rules via `--rule`.
+- Larger-than-Life defaults and presets are validated against neighborhood size, so invalid ranges fail fast.
 - `ruleloader` loads JSON specs and a limited `.rule`-like text format via `--rule-file`.
 - `auto` profiles candidate backends (`quicklife`, `hashlife`, `numba`, `torch`) and locks to the fastest.
 - `quicklife` and `hashlife` are Golly-inspired ideas, not full algorithm-identical reimplementations.
