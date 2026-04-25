@@ -1180,6 +1180,10 @@ def build_engine(
         return HashLifeEngine(width=width, height=height, wrap=wrap)
     if backend == "hashlife-tree":
         return HashLifeTreeEngine(width=width, height=height, wrap=wrap)
+    if backend == "rl":
+        from gameoflife.backends.rl_backend import RLBackendEngine
+
+        return RLBackendEngine(width=width, height=height, wrap=wrap)
     if backend == "numba":
         if NUMBA_AVAILABLE:
             return DenseNumbaEngine(width=width, height=height, wrap=wrap)
@@ -1472,13 +1476,14 @@ def parse_args() -> argparse.Namespace:
             "quicklife",
             "hashlife",
             "hashlife-tree",
+            "rl",
             "numba",
             "torch",
         ),
         default="auto",
         help=(
             "Simulation backend: auto (torch conv if available, else quicklife), "
-            "jvn, generations, largerlife, ruleloader, quicklife, hashlife, hashlife-tree, "
+            "jvn, generations, largerlife, ruleloader, quicklife, hashlife, hashlife-tree, rl, "
             "numba, or torch-conv2d CPU"
         ),
     )
@@ -1523,6 +1528,11 @@ def parse_args() -> argparse.Namespace:
         "--doctor",
         action="store_true",
         help="Run environment and backend diagnostics, then exit.",
+    )
+    parser.add_argument(
+        "--rl-stats",
+        action="store_true",
+        help="Enable periodic RL backend inference stats output (avg/max/last ms).",
     )
     return parser.parse_args()
 
@@ -1596,6 +1606,7 @@ def run_benchmark_all(
         "quicklife",
         "hashlife",
         "hashlife-tree",
+        "rl",
         "numba",
         "torch",
     ):
@@ -1604,6 +1615,9 @@ def run_benchmark_all(
             continue
         if backend == "torch" and not TORCH_AVAILABLE:
             print("backend=torch skipped reason=torch_unavailable")
+            continue
+        if backend == "rl" and not TORCH_AVAILABLE:
+            print("backend=rl skipped reason=torch_unavailable")
             continue
         if backend == "ruleloader" and not rule_file:
             print("backend=ruleloader skipped reason=rule_file_missing")
@@ -1682,6 +1696,11 @@ def main() -> None:
         return
 
     engine = build_engine(args.backend, width, height, args.wrap, args.rule, args.rule_file, args.rule_preset)
+    if args.rl_stats and hasattr(engine, "set_stats"):
+        try:
+            engine.set_stats(True)
+        except Exception:
+            pass
 
     if args.benchmark_steps > 0:
         sps, throughput, alive = run_benchmark(engine, args.pattern, args.density, args.seed, benchmark_steps)

@@ -15,6 +15,7 @@ Default UI is now terminal `tui` (retro black/white).
 - `quicklife`: QuickLife-inspired ROI-updating dense engine.
 - `hashlife`: HashLife-inspired memoized transition cache.
 - `hashlife-tree`: Built-in quadtree HashLife-style core with canonical node interning and memoized transitions/jumps.
+- `rl`: RL-controlled adaptive jump backend (TorchScript policy + `hashlife-tree.advance(K)`).
 - `numba`: JIT-compiled dense grid update kernel for high-throughput stepping.
 - `torch`: CPU `conv2d` backend using an explicit Life kernel.
 
@@ -34,6 +35,12 @@ uv pip install -e .
 ```
 
 For Torch backend support:
+
+```bash
+uv pip install -e '.[torch]'
+```
+
+`.[torch]` now includes RL training dependencies (Gym + Lightning + TensorBoard), so training works out of the box:
 
 ```bash
 uv pip install -e '.[torch]'
@@ -93,6 +100,9 @@ gameoflife --backend hashlife --pattern glider-gun --width 1200 --height 800 --i
 # Quadtree HashLife-style core
 gameoflife --backend hashlife-tree --pattern glider-gun --width 1200 --height 800 --interval 40
 
+# RL adaptive jump backend (uses trained TorchScript agent if available)
+gameoflife --backend rl --pattern random --density 0.2 --width 800 --height 500 --interval 20
+
 # Torch CPU convolution backend
 gameoflife --backend torch --pattern random --density 0.2 --width 600 --height 400 --interval 10
 
@@ -121,7 +131,7 @@ gameoflife --help
 Main options:
 
 - `--ui {gui,tui}`
-- `--backend {auto,jvn,generations,largerlife,ruleloader,quicklife,hashlife,hashlife-tree,numba,torch}`
+- `--backend {auto,jvn,generations,largerlife,ruleloader,quicklife,hashlife,hashlife-tree,rl,numba,torch}`
 - `--rule` for `jvn`/`generations`/`largerlife`
 - `--rule-preset` for `largerlife` (`bosco`, `coral`, `nova`, `storm`)
 - `--rule-file` for `ruleloader`
@@ -133,6 +143,7 @@ Main options:
 - `--benchmark-steps N` (headless performance run)
 - `--benchmark-all` (run all available backends with one command)
 - `--doctor` (environment and backend diagnostics)
+- `--rl-stats` (prints periodic RL inference latency stats when using `--backend rl`)
 
 Benchmark example:
 
@@ -142,6 +153,55 @@ gameoflife --backend numba --pattern random --density 0.2 --width 1000 --height 
 gameoflife --backend torch --pattern random --density 0.2 --width 1000 --height 700 --benchmark-steps 300
 gameoflife --pattern random --density 0.2 --width 1000 --height 700 --benchmark-steps 300 --benchmark-all
 ```
+
+## RL Adaptive Step Jumper
+
+This repo includes an RL controller that learns jump sizes for multi-generation stepping using `hashlife-tree.advance(n)`.
+
+- Action space: `{1, 2, 4, 8, 16, 32}`
+- Reward: `jump_size - lambda_penalty * error`
+- Error: L1 difference between forward-model prediction and simulator output
+- Models: policy/value net + forward model CNN (separable; forward model can be frozen)
+
+Files:
+
+- `gameoflife/rl/env.py` (Gym-compatible environment)
+- `gameoflife/rl/models.py` (policy/value and forward model networks)
+- `gameoflife/rl/train.py` (Lightning training: forward-model warmup + PPO policy)
+- `gameoflife/rl/eval.py` (evaluation + jump-overlay visualization)
+- `gameoflife/backends/rl_backend.py` (runtime backend used by `--backend rl`)
+- `config.yaml` (training/environment hyperparameters)
+
+Second-pass speedup:
+
+- Vectorized PPO rollout collection with parallel environments (`train.num_envs`)
+- Batched policy inference and batched forward-model prediction per rollout step
+
+Train and export the runtime agent:
+
+```bash
+gameoflife-train-rl --config config.yaml
+```
+
+This exports:
+
+- `gameoflife/backends/rl_agent.pt` (TorchScript policy used at runtime)
+- `gameoflife/backends/rl_forward.pt` (TorchScript forward model)
+- Policy export uses dynamic int8 quantization for linear layers by default (`train.quantize_policy: true`) to keep artifact size small.
+
+If the agent is missing, `--backend rl` gracefully falls back to `auto` and prints:
+
+`RL agent not trained yet. Run: gameoflife-train-rl`
+
+`rl` backend includes runtime inference telemetry and warns periodically if average policy inference exceeds 5ms.
+
+Evaluate and export overlay animation:
+
+```bash
+gameoflife-rl-eval --config config.yaml --checkpoint runs/adaptive-jump/version_0/checkpoints/last.ckpt --out adaptive_jump_eval.gif --steps 160
+```
+
+Scale training throughput by increasing `train.num_envs` in `config.yaml` (for example `8`, `16`, `32` depending on CPU/RAM).
 
 ## Notes
 
