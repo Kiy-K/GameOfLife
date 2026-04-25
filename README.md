@@ -199,7 +199,9 @@ Training performance knobs in `config.yaml`:
 
 - `train.num_workers` (set >0 for dataloader worker processes)
 - `train.pin_memory` and `train.persistent_workers`
+- `train.prefetch_factor` (only when `num_workers > 0`)
 - `train.matmul_precision: high` (enables Tensor Core-friendly float32 matmul mode)
+- `train.accumulate_grad_batches` (increase if env stepping bursts starve GPU)
 
 Evaluate and export overlay animation:
 

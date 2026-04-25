@@ -322,14 +322,17 @@ class AdaptiveJumpLightning(pl.LightningModule):
         num_workers = max(0, int(requested_workers))
         pin_memory = bool(self.cfg["train"].get("pin_memory", torch.cuda.is_available()))
         persistent_workers = bool(self.cfg["train"].get("persistent_workers", True)) and num_workers > 0
-        return DataLoader(
-            _DummyDataset(updates),
-            batch_size=1,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-        )
+        loader_kwargs = {
+            "batch_size": 1,
+            "shuffle": False,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "persistent_workers": persistent_workers,
+        }
+        if num_workers > 0:
+            prefetch_factor = max(1, int(self.cfg["train"].get("prefetch_factor", 2)))
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+        return DataLoader(_DummyDataset(updates), **loader_kwargs)
 
     def export_torchscript(
         self,
@@ -414,7 +417,9 @@ def _default_cfg() -> dict:
             "num_workers": 7,
             "pin_memory": True,
             "persistent_workers": True,
+            "prefetch_factor": 4,
             "matmul_precision": "high",
+            "accumulate_grad_batches": 1,
             "log_dir": "runs",
         },
     }
@@ -445,6 +450,7 @@ def main() -> None:
         logger=logger,
         accelerator="auto",
         devices=1,
+        accumulate_grad_batches=max(1, int(cfg["train"].get("accumulate_grad_batches", 1))),
         log_every_n_steps=1,
         default_root_dir=cfg["train"].get("log_dir", "runs"),
     )
