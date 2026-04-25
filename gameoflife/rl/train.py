@@ -109,13 +109,13 @@ class AdaptiveJumpLightning(pl.LightningModule):
         for _ in range(self.rollout_steps):
             actions = np.random.randint(0, len(ACTION_SET), size=self.num_envs)
             for i, env in enumerate(self.envs):
-                obs, _, done, _, info = env.step_with_prediction(int(actions[i]), predicted=None)
+                obs_i, _, done, _, info = env.step_with_prediction(int(actions[i]), predicted=None)
                 model_inputs.append(info["model_input"].astype(np.float32))
                 targets.append(info["model_target"].astype(np.float32))
                 action_indices.append(int(actions[i]))
                 if done:
-                    obs, _ = env.reset()
-                self._obs[i] = obs
+                    obs_i, _ = env.reset()
+                self._obs[i] = obs_i
 
         x = torch.tensor(np.asarray(model_inputs), dtype=torch.float32, device=self.device).unsqueeze(1)
         a = torch.tensor(action_indices, dtype=torch.long, device=self.device)
@@ -145,40 +145,44 @@ class AdaptiveJumpLightning(pl.LightningModule):
         jump_vals = []
         error_vals = []
 
-        for t in range(self.rollout_steps):
-            obs_t = torch.from_numpy(self._obs).to(self.device, dtype=torch.float32)
-            patch_t, stats_t = self._split_obs(obs_t)
-
-            logits, values = self.policy(patch_t, stats_t)
-            dist = Categorical(logits=logits)
-            actions = dist.sample()
-            logp = dist.log_prob(actions)
-
-            model_inputs = np.asarray([env.current_model_input() for env in self.envs], dtype=np.float32)
-            preds = self._predict_forward_batch(model_inputs, actions)
-
-            next_obs = np.zeros_like(self._obs)
-            for i, env in enumerate(self.envs):
-                obs_i, reward_i, done_i, _, info_i = env.step_with_prediction(int(actions[i].item()), preds[i])
-                obs_buf[t, i] = self._obs[i]
-                actions_buf[t, i] = int(actions[i].item())
-                logp_buf[t, i] = float(logp[i].item())
-                values_buf[t, i] = float(values[i].item())
-                rewards_buf[t, i] = float(reward_i)
-                dones_buf[t, i] = float(done_i)
-                model_input_buf[t, i] = info_i["model_input"]
-                model_target_buf[t, i] = info_i["model_target"]
-
-                jump_vals.append(float(info_i["jump"]))
-                error_vals.append(float(info_i["error"]))
-
-                if done_i:
-                    obs_i, _ = env.reset()
-                next_obs[i] = obs_i
-
-            self._obs = next_obs
-
+        # FIX 1: Entire rollout collection must run under no_grad.
+        # Without this, every policy forward pass during data collection
+        # builds a computation graph — 1024 graphs for rollout_steps=128,
+        # num_envs=8 — blowing up VRAM and making rollout 3-5x slower.
         with torch.no_grad():
+            for t in range(self.rollout_steps):
+                obs_t = torch.from_numpy(self._obs).to(self.device, dtype=torch.float32)
+                patch_t, stats_t = self._split_obs(obs_t)
+
+                logits, values = self.policy(patch_t, stats_t)
+                dist = Categorical(logits=logits)
+                actions = dist.sample()
+                logp = dist.log_prob(actions)
+
+                model_inputs = np.asarray([env.current_model_input() for env in self.envs], dtype=np.float32)
+                preds = self._predict_forward_batch(model_inputs, actions)
+
+                next_obs = np.zeros_like(self._obs)
+                for i, env in enumerate(self.envs):
+                    obs_i, reward_i, done_i, _, info_i = env.step_with_prediction(int(actions[i].item()), preds[i])
+                    obs_buf[t, i] = self._obs[i]
+                    actions_buf[t, i] = int(actions[i].item())
+                    logp_buf[t, i] = float(logp[i].item())
+                    values_buf[t, i] = float(values[i].item())
+                    rewards_buf[t, i] = float(reward_i)
+                    dones_buf[t, i] = float(done_i)
+                    model_input_buf[t, i] = info_i["model_input"]
+                    model_target_buf[t, i] = info_i["model_target"]
+
+                    jump_vals.append(float(info_i["jump"]))
+                    error_vals.append(float(info_i["error"]))
+
+                    if done_i:
+                        obs_i, _ = env.reset()
+                    next_obs[i] = obs_i
+
+                self._obs = next_obs
+
             next_obs_t = torch.from_numpy(self._obs).to(self.device, dtype=torch.float32)
             next_patch_t, next_stats_t = self._split_obs(next_obs_t)
             _, next_values = self.policy(next_patch_t, next_stats_t)
@@ -313,6 +317,7 @@ class AdaptiveJumpLightning(pl.LightningModule):
                 all_value_loss += float(value_loss.detach().item())
                 all_entropy += float(entropy.detach().item())
                 all_forward_loss += float(forward_loss.detach().item())
+
         if accum_i % self.accumulate_steps != 0:
             nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
             opt.step()
@@ -365,29 +370,31 @@ class AdaptiveJumpLightning(pl.LightningModule):
         self.eval()
         if self._best_policy_state is not None:
             self.policy.load_state_dict(self._best_policy_state)
+
         policy_adapter = ScriptedJumpPolicy(self.policy, patch_size=self.patch_size).cpu().eval()
 
         if quantize_policy:
             try:
-                quantize_dynamic = getattr(torch, "quantization", None)
-                if quantize_dynamic is not None and hasattr(quantize_dynamic, "quantize_dynamic"):
-                    policy_adapter = quantize_dynamic.quantize_dynamic(
-                        policy_adapter,
-                        {nn.Linear},
-                        dtype=torch.qint8,
-                    )
-                else:
+                try:
                     from torch.ao.quantization import quantize_dynamic as ao_quantize_dynamic
-
                     policy_adapter = ao_quantize_dynamic(policy_adapter, {nn.Linear}, dtype=torch.qint8)
+                except ImportError:
+                    policy_adapter = torch.quantization.quantize_dynamic(
+                        policy_adapter, {nn.Linear}, dtype=torch.qint8
+                    )
             except Exception as exc:
                 print(f"[warn] policy quantization failed ({exc}); exporting non-quantized policy.")
 
-        scripted_policy = torch.jit.script(policy_adapter)
+        # FIX 2: torch.jit.script fails on dynamically quantized models because
+        # quantized ops are not scriptable. Use torch.jit.trace with a dummy
+        # input instead — this works for both quantized and non-quantized cases.
+        dummy_obs = torch.zeros(1, self.patch_size * self.patch_size + 3)
+        scripted_policy = torch.jit.trace(policy_adapter, dummy_obs)
         scripted_policy.save(agent_path)
 
         forward_bytes = 0
         if forward_path:
+            # ForwardModelCNN has no quantization applied, so script works fine.
             scripted_forward = torch.jit.script(self.forward_model.cpu().eval())
             scripted_forward.save(forward_path)
             forward_bytes = Path(forward_path).stat().st_size
