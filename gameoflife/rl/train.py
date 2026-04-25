@@ -68,6 +68,7 @@ class AdaptiveJumpLightning(pl.LightningModule):
         self.entropy_coef = float(train_cfg.get("entropy_coef", 0.01))
         self.value_coef = float(train_cfg.get("value_coef", 0.5))
         self.forward_coef = float(train_cfg.get("forward_coef", 1.0))
+        self.accumulate_steps = max(1, int(train_cfg.get("accumulate_grad_batches", 1)))
 
         self.lambda_start = float(train_cfg.get("lambda_start", 0.1))
         self.lambda_end = float(train_cfg.get("lambda_end", 0.3))
@@ -231,17 +232,31 @@ class AdaptiveJumpLightning(pl.LightningModule):
 
         if self.current_epoch < self.forward_warmup_epochs:
             losses = []
+            opt.zero_grad()
+            accum_i = 0
             for _ in range(self.forward_batches_per_epoch):
                 x, a, y = self._collect_forward_batch()
                 pred = self.forward_model(x, a)
-                loss = nn.functional.binary_cross_entropy_with_logits(pred, y)
-                opt.zero_grad()
+                loss = nn.functional.binary_cross_entropy_with_logits(pred, y) / float(self.accumulate_steps)
                 self.manual_backward(loss)
+                accum_i += 1
+                if accum_i % self.accumulate_steps == 0:
+                    nn.utils.clip_grad_norm_(self.forward_model.parameters(), max_norm=1.0)
+                    opt.step()
+                    opt.zero_grad()
+                losses.append(float(loss.detach().item()))
+            if accum_i % self.accumulate_steps != 0:
                 nn.utils.clip_grad_norm_(self.forward_model.parameters(), max_norm=1.0)
                 opt.step()
-                losses.append(float(loss.detach().item()))
+                opt.zero_grad()
             self.log("phase", 0.0, on_step=False, on_epoch=True)
-            self.log("loss/forward_warmup", float(np.mean(losses)), on_step=False, on_epoch=True, prog_bar=True)
+            self.log(
+                "loss/forward_warmup",
+                float(np.mean(losses) * float(self.accumulate_steps)),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+            )
             return
 
         rollout = self._collect_ppo_rollout()
@@ -252,6 +267,8 @@ class AdaptiveJumpLightning(pl.LightningModule):
         all_forward_loss = 0.0
 
         n = int(rollout["obs"].shape[0])
+        opt.zero_grad()
+        accum_i = 0
         for _ in range(self.ppo_epochs):
             perm = torch.randperm(n, device=self.device)
             for start in range(0, n, self.minibatch_size):
@@ -284,17 +301,22 @@ class AdaptiveJumpLightning(pl.LightningModule):
                     + (self.value_coef * value_loss)
                     - (self.entropy_coef * entropy)
                     + (self.forward_coef * forward_loss)
-                )
-
-                opt.zero_grad()
+                ) / float(self.accumulate_steps)
                 self.manual_backward(loss)
-                nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-                opt.step()
+                accum_i += 1
+                if accum_i % self.accumulate_steps == 0:
+                    nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+                    opt.step()
+                    opt.zero_grad()
 
                 all_policy_loss += float(policy_loss.detach().item())
                 all_value_loss += float(value_loss.detach().item())
                 all_entropy += float(entropy.detach().item())
                 all_forward_loss += float(forward_loss.detach().item())
+        if accum_i % self.accumulate_steps != 0:
+            nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+            opt.step()
+            opt.zero_grad()
 
         self.log("phase", 1.0, on_step=False, on_epoch=True)
         self.log("rollout/mean_jump", float(rollout["mean_jump"]), on_step=False, on_epoch=True, prog_bar=True)
@@ -450,7 +472,6 @@ def main() -> None:
         logger=logger,
         accelerator="auto",
         devices=1,
-        accumulate_grad_batches=max(1, int(cfg["train"].get("accumulate_grad_batches", 1))),
         log_every_n_steps=1,
         default_root_dir=cfg["train"].get("log_dir", "runs"),
     )
