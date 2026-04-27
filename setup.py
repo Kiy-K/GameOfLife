@@ -14,6 +14,7 @@ setup(
         "numpy>=1.26",
         "numba>=0.59",
         "PyYAML>=6.0",
+        "imageio>=2.28",
     ],
     extras_require={
         "torch": [

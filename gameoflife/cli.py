@@ -11,6 +11,9 @@ from typing import Iterable
 
 import numpy as np
 
+from gameoflife.patterns import ALL_PATTERNS, get_pattern
+from gameoflife.video import export_video, capture_simulation
+
 try:
     from numba import njit
 
@@ -603,12 +606,13 @@ class RuleLoaderEngine(DenseVectorizedEngine):
         return (self.board > 0).astype(np.uint8)
 
 if NUMBA_AVAILABLE:
+    from numba import prange
 
-    @njit(cache=False)
+    @njit(cache=False, parallel=True)
     def _step_bounded_numba(board: np.ndarray) -> np.ndarray:
         h, w = board.shape
         out = np.zeros((h, w), dtype=np.uint8)
-        for y in range(h):
+        for y in prange(h):
             for x in range(w):
                 neighbors = 0
                 for dy in (-1, 0, 1):
@@ -713,6 +717,120 @@ class DenseTorchEngine(LifeEngine):
 
         alive = self.board == 1
         self.board = ((neighbors == 3.0) | (alive & (neighbors == 2.0))).to(torch.uint8)
+
+    def alive_count(self) -> int:
+        return int(self.board.sum().item())
+
+    def alive_points(self) -> np.ndarray:
+        points = torch.nonzero(self.board, as_tuple=False)
+        if points.numel() == 0:
+            return np.empty((0, 2), dtype=float)
+        points_np = points.cpu().numpy()
+        return np.column_stack((points_np[:, 1], points_np[:, 0])).astype(float)
+
+    def board_view(self) -> np.ndarray:
+        return self.board.cpu().numpy()
+
+
+@dataclass
+class DenseCUDAEngine(LifeEngine):
+    """
+    CUDA GPU-accelerated engine using PyTorch with automatic GPU detection.
+    
+    Uses torch.cuda for GPU acceleration when available, Falls back to CPU
+    when CUDA is not available. Supports custom rules via rule string (B.../S...).
+    """
+    width: int
+    height: int
+    wrap: bool = False
+    rule: str = "B3/S23"
+    board: torch.Tensor = field(init=False)
+    kernel: torch.Tensor = field(init=False)
+    _device: str = field(init=False)
+    _rule_parsed: tuple[set[int], set[int]] = field(init=False)
+
+    name = "cuda"
+    display_mode = "image"
+
+    def __post_init__(self) -> None:
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("CUDA backend selected but torch is not installed.")
+        
+        # Auto-detect CUDA GPU
+        if torch.cuda.is_available():
+            self._device = "cuda"
+        else:
+            self._device = "cpu"
+        
+        # Parse rule string
+        self._rule_parsed = self._parse_rule(self.rule)
+        birth, survive = self._rule_parsed
+        max_neighbors = 9
+        
+        self.board = torch.zeros((self.height, self.width), dtype=torch.uint8, device=self._device)
+        
+        # Create pre-computed lookup table for faster transitions
+        # Maps (neighbor_count, current_state) -> next_state
+        self._transition = torch.zeros((max_neighbors + 1, 2), dtype=torch.uint8, device=self._device)
+        for n in range(max_neighbors + 1):
+            self._transition[n, 0] = 1 if n in birth else 0
+            self._transition[n, 1] = 1 if n in survive else 0
+        
+        # Pre-create kernel on appropriate device
+        self.kernel = torch.tensor(
+            [[1.0, 1.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0]],
+            dtype=torch.float32,
+            device=self._device,
+        ).view(1, 1, 3, 3)
+
+    @staticmethod
+    def _parse_rule(rule: str) -> tuple[set[int], set[int]]:
+        """Parse rule string like 'B3/S23' into birth/survive sets."""
+        birth, survive = set(), set()
+        if '/' not in rule:
+            return birth, survive
+        
+        parts = rule.split('/')
+        for part in parts:
+            target = birth if part.startswith('B') else survive if part.startswith('S') else None
+            if target is not None:
+                nums = ''.join(c for c in part if c.isdigit())
+                target.update(int(c) for c in nums)
+        return birth, survive
+
+    def clear(self) -> None:
+        self.board.zero_()
+
+    def randomize(self, density: float, seed: int) -> None:
+        self.clear()
+        # Use CPU for random generation then transfer to GPU
+        cpu_board = (np.random.default_rng(seed).random((self.height, self.width)) < density).astype(np.uint8)
+        self.board = torch.from_numpy(cpu_board).to(device=self._device)
+
+    def seed_pattern(self, pattern: Iterable[tuple[int, int]], anchor_x: int = 0, anchor_y: int = 0) -> None:
+        self.clear()
+        for dx, dy in pattern:
+            x = anchor_x + dx
+            y = anchor_y + dy
+            if self.wrap:
+                self.board[y % self.height, x % self.width] = 1
+            elif 0 <= x < self.width and 0 <= y < self.height:
+                self.board[y, x] = 1
+
+    def step(self) -> None:
+        board_f = self.board.to(torch.float32)
+        x = board_f.unsqueeze(0).unsqueeze(0)
+
+        if self.wrap:
+            x = F.pad(x, (1, 1, 1, 1), mode="circular")
+            neighbors = F.conv2d(x, self.kernel).squeeze(0).squeeze(0)
+        else:
+            neighbors = F.conv2d(x, self.kernel, padding=1).squeeze(0).squeeze(0)
+
+        # Use pre-computed transition table
+        neighbors_int = neighbors.to(torch.int64).clamp(0, 9)
+        alive = self.board == 1
+        self.board = self._transition[neighbors_int, alive.to(torch.int64)].to(torch.uint8)
 
     def alive_count(self) -> int:
         return int(self.board.sum().item())
@@ -1180,6 +1298,9 @@ def build_engine(
         return HashLifeEngine(width=width, height=height, wrap=wrap)
     if backend == "hashlife-tree":
         return HashLifeTreeEngine(width=width, height=height, wrap=wrap)
+    if backend == "hashlife-infinite":
+        from gameoflife.hashlife_infinite import InfiniteHashLifeEngine
+        return InfiniteHashLifeEngine(width=width, height=height, wrap=wrap, rule=rule or "B3/S23")
     if backend == "rl":
         from gameoflife.backends.rl_backend import RLBackendEngine
 
@@ -1188,6 +1309,11 @@ def build_engine(
         if NUMBA_AVAILABLE:
             return DenseNumbaEngine(width=width, height=height, wrap=wrap)
         print("[warn] numba backend requested but numba is unavailable; falling back to quicklife.")
+        return QuickLifeEngine(width=width, height=height, wrap=wrap)
+    if backend == "cuda":
+        if TORCH_AVAILABLE:
+            return DenseCUDAEngine(width=width, height=height, wrap=wrap, rule=rule or "B3/S23")
+        print("[warn] cuda backend requested but torch is unavailable; falling back to quicklife.")
         return QuickLifeEngine(width=width, height=height, wrap=wrap)
     if backend == "torch":
         if TORCH_AVAILABLE:
@@ -1454,9 +1580,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wrap", action="store_true", help="Use toroidal wrapping at edges")
     parser.add_argument(
         "--pattern",
-        choices=("glider-gun", "random", "empty"),
+        choices=tuple(["random", "empty"] + list(ALL_PATTERNS.keys())),
         default="glider-gun",
-        help="Initial board pattern",
+        help="Initial board pattern: random, empty, or pattern name (see gameoflife/patterns.py)",
     )
     parser.add_argument("--interval", type=int, default=30, help="Animation interval in milliseconds")
     parser.add_argument(
@@ -1476,15 +1602,17 @@ def parse_args() -> argparse.Namespace:
             "quicklife",
             "hashlife",
             "hashlife-tree",
+            "hashlife-infinite",
             "rl",
             "numba",
             "torch",
+            "cuda",
         ),
         default="auto",
         help=(
             "Simulation backend: auto (torch conv if available, else quicklife), "
-            "jvn, generations, largerlife, ruleloader, quicklife, hashlife, hashlife-tree, rl, "
-            "numba, or torch-conv2d CPU"
+            "jvn, generations, largerlife, ruleloader, quicklife, hashlife, hashlife-tree, "
+            "hashlife-infinite, rl, numba, torch conv2d, or cuda GPU"
         ),
     )
     parser.add_argument(
@@ -1525,6 +1653,24 @@ def parse_args() -> argparse.Namespace:
         help="Benchmark all available backends headlessly and exit (uses --benchmark-steps).",
     )
     parser.add_argument(
+        "--export-video",
+        type=str,
+        default=None,
+        help="Export simulation to video file (.mp4 or .gif)",
+    )
+    parser.add_argument(
+        "--export-fps",
+        type=int,
+        default=30,
+        help="Frames per second for video export",
+    )
+    parser.add_argument(
+        "--export-scale",
+        type=int,
+        default=2,
+        help="Pixel scale for video export (1=original, 2=2x, etc.)",
+    )
+    parser.add_argument(
         "--doctor",
         action="store_true",
         help="Run environment and backend diagnostics, then exit.",
@@ -1540,10 +1686,12 @@ def parse_args() -> argparse.Namespace:
 def _initialize_engine(engine: LifeEngine, pattern: str, density: float, seed: int) -> None:
     if pattern == "random":
         engine.randomize(density, seed)
-    elif pattern == "glider-gun":
-        anchor_x = max(0, engine.width // 2 - 18)
-        anchor_y = max(0, engine.height // 2 - 5)
-        engine.seed_pattern(GOSPER_GLIDER_GUN, anchor_x, anchor_y)
+    elif pattern in ALL_PATTERNS:
+        # Use pattern from library
+        pattern_cells = ALL_PATTERNS[pattern]
+        anchor_x = max(0, engine.width // 2 - 10)
+        anchor_y = max(0, engine.height // 2 - 10)
+        engine.seed_pattern(pattern_cells, anchor_x, anchor_y)
     else:
         engine.clear()
 
@@ -1705,6 +1853,18 @@ def main() -> None:
     if args.benchmark_steps > 0:
         sps, throughput, alive = run_benchmark(engine, args.pattern, args.density, args.seed, benchmark_steps)
         print_benchmark_result(engine.name, benchmark_steps, sps, throughput, alive)
+        return
+
+    # Video export mode (headless)
+    if args.export_video:
+        _initialize_engine(engine, args.pattern, args.density, args.seed)
+        frames = capture_simulation(engine, steps=benchmark_steps, skip=1)
+        export_video(
+            args.export_video,
+            frames,
+            fps=args.export_fps,
+            pixel_size=args.export_scale,
+        )
         return
 
     if args.pattern == "random":
